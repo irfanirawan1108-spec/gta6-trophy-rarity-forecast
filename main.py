@@ -1,32 +1,42 @@
-"""gta6-trophy-rarity-forecast-01's starter in Python 3.13 (standard library only): persistence.
+"""gta6-trophy-rarity-forecast-01 entry: Leonida Rarity Forecaster (Python 3.13, standard library only).
 
-The same program as starter/main.ts (the house baseline), number for number: it forecasts that every trophy's earn rate
-on Exophase at the case's target is the rate in the case's last read, with a spread that widens like a random walk's on
-the logit scale:
+Forecasts each GTA VI PS5 trophy's Exophase earn rate at the case's target, as five quantiles
+(5/25/50/75/95%) in percent.
 
-    q_tau = 100 / (1 + exp(-(logit(r) + z_tau * 0.5 * sqrt(d)))), rounded to 4 decimals (half up)
+Why this beats the house baseline (persistence + random-walk spread): the house baseline says every
+rate stays where the last read put it. That is wrong in launch week for a structural reason the
+rules themselves document: Exophase's tracked-player count jumps at each refresh (638 -> 3,868 at
+the first refresh, 2026-11-19T04:30Z), and every rate but the 100% one falls when the denominator
+jumps, because the new players have not earned anything yet. So a rate is a ratio, earners over
+tracked players, and the two sides move on different clocks: the denominator surges with sales
+while the numerator grows only as players actually play. This program models the two sides
+separately and combines them, then blends with a logit-trend fit:
 
-for each trophy, where r is its rate in the last read of the case's history (percent, clamped to 0.01..99.99 before the
-logit), d the case's horizon in days (horizon_minutes / 1440) and z_tau the standard normal's quantile at each level
-(0.05, 0.25, 0.5, 0.75, 0.95): -1.645, -0.674, 0, 0.674, 1.645.
+  Model A (numerator/denominator): least-squares slopes of ln(tracked) and ln(earners) against
+    time over the last 24 h of reads, extrapolated to the target with growth that decays
+    exponentially (time constant 2 days: a launch surge cannot compound forever). Forecast
+    rate = 100 * earners(target) / tracked(target), earners capped at tracked.
+  Model B (logit trend, house-curve style): least-squares line of logit(rate) against
+    ln(1 + hours since release) over the last 24 h, extrapolated to the target with the slope
+    shrunk by H / (H + 1.5 days). The median is the logit-average of A and B.
+  Prior (flat early history only): when every read is identical and the checkpoint is before the
+    documented first refresh (2026-11-19T04:30Z, tracked 638 -> 3,868), the next refresh is a
+    denominator jump, not a flat line: forecast tracked = 3,868 (the documented count) with
+    earners growing 5%/hour of play, so the median falls by roughly the jump ratio. This only
+    fires on flat launch-night histories; a rich history (the final's ~2 days of reads) never
+    triggers it, because the data then speaks for itself.
 
-How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in python:3.13-slim, standard library only: no
-network, no pip packages. -P keeps this file's directory OFF sys.path, so a module you ship beside main.py (say
-/bot/model.py) imports only after the sys.path line below, which puts the directory first; -s drops user
-site-packages.
+Spread (logit scale) is honest about a multi-day horizon: random-walk 0.5*sqrt(days), plus the
+trend fit's prediction uncertainty, plus half the disagreement between models A and B, plus 0.7
+when the refresh prior fires; floored at 0.35, capped at 2.5. Quantiles are the median shifted by
+the standard normal's z at each level, rounded to 4 decimals (half up, as the starter rounds).
 
-What an entry must do:
-  - read every <id>.in in the input directory (the grader runs one case at a time, with only that case's file there):
-    JSON {"schema": "makefun/gta6-trophies-case/v1", "id", "at", "horizon_minutes", "target", "levels", "game",
-    "trophies", "history", "notes"}, where `trophies` lists the case's trophies {id, name, description, tier, points,
-    secret} and `history` every read before `at`, oldest first, each {slot, at, players_tracked, trophies_earned,
-    rates}, `rates` in the order of `trophies` (null where that read lacked the trophy);
-  - write <id>.out to the output directory: {"trophies": [{"id": 1, "q": [q05, q25, q50, q75, q95]}, ...]}, one row
-    for each of the case's trophies, each id once, no other key, each q five finite numbers from 0 to 100 (percent),
-    non-decreasing; at most 65,536 bytes. Anything else is an invalid case, scored as if every quantile equalled the
-    trophy's rate in the last read, and an entry with an invalid case takes no prize.
+Deterministic: pure arithmetic, no randomness, no wall-clock reads, no network. Two runs on the
+same case write byte-identical output. Runtime is O(reads x trophies) with the standard library
+only, far under the 8-second cap (a 2,800-read final-like case runs in well under a second).
 
-Outside the grader's container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output:
+How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in python:3.13-slim.
+Outside the grader, MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR stand in for /input and /output:
     mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
 """
 
@@ -34,9 +44,11 @@ import json
 import math
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path: put it back first, so `import model` finds a model.py shipped beside this file.
+# The grader's -P leaves /bot off sys.path: put it back first, so an `import model` would find a
+# model.py shipped beside this file. (This entry is one file; the line is kept for parity.)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
@@ -46,8 +58,21 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 # The standard normal's quantile at each level.
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
-# The spread of a rate's move, in logit units per square-root day.
-SIGMA = 0.5
+
+# --- Model constants (fixed in advance, never tuned on the practice answers, which are server-side).
+SIGMA_RW = 0.5          # random-walk spread, logit units per sqrt(day) (the house baseline's).
+TAU_DAMP_DAYS = 2.0     # launch-surge growth decays with this time constant.
+TREND_SHRINK_DAYS = 1.5  # logit-trend slope shrink: H / (H + this).
+LOGIT_CAP = 3.0         # a forecast never moves more than this many logit units from the last rate.
+FIT_A_WINDOW_H = 24.0   # model A fits the last 24 h of reads (adapts fastest to the current regime).
+FIT_B_WINDOW_H = 24.0   # model B fits the last 24 h of reads.
+SPREAD_FLOOR = 0.35     # never narrower than this (a refresh can always surprise).
+SPREAD_CAP = 2.5        # never wider than this (width is paid for at every trophy).
+PRIOR_SPREAD = 0.7      # extra spread when the documented-refresh prior fires.
+PRIOR_REFRESH_AT = "2026-11-19T04:30:00Z"  # the first refresh the rules document.
+PRIOR_TRACKED = 3868.0  # tracked players at that refresh, as the rules document (was 638).
+PRIOR_EARNERS_PER_HOUR = 0.05  # earners grow ~5%/hour of play while the denominator jumps.
+RELEASE_AT = "2026-11-19T00:00:00Z"  # GTA VI's release; the logit trend's x-origin.
 
 
 def clamp(x: float) -> float:
@@ -58,11 +83,15 @@ def logit(pct: float) -> float:
     return math.log(clamp(pct) / (100 - clamp(pct)))
 
 
-def round4(x: float) -> float | int:
-    """x rounded to 4 decimals, half up, as JavaScript's Math.round(x * 10000) / 10000 rounds it.
+def sigmoid(lg: float) -> float:
+    if lg >= 0:
+        return 100 / (1 + math.exp(-lg))
+    e = math.exp(lg)
+    return 100 * e / (1 + e)
 
-    A whole number comes back as an int, so json.dumps writes 100 where JavaScript writes 100 (not 100.0).
-    """
+
+def round4(x: float) -> float | int:
+    """x rounded to 4 decimals, half up, as JavaScript's Math.round(x * 10000) / 10000 rounds it."""
     scaled = x * 10000
     whole = math.floor(scaled)
     if scaled - whole >= 0.5:
@@ -71,18 +100,175 @@ def round4(x: float) -> float | int:
     return int(value) if value.is_integer() else value
 
 
+def parse_time(s: str) -> datetime:
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def linfit(xs: list[float], ys: list[float]) -> tuple[float, float, float]:
+    """Least squares y = a + b*x. Returns (intercept, slope, residual std)."""
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if n < 3 or sxx <= 0:
+        return my, 0.0, 0.0
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    b = sxy / sxx
+    a = my - b * mx
+    resid = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
+    sd = math.sqrt(resid / max(1, n - 2))
+    return a, b, sd
+
+
 def forecast_case(case: dict, name: str) -> dict:
     if case["levels"] != LEVELS:
         raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    if not case["history"]:
-        raise ValueError(f"{name} has no history")
-    last = case["history"][-1]
-    spread = SIGMA * math.sqrt(case["horizon_minutes"] / 1440)
+    trophies = case["trophies"]
+    history = case["history"]
+    horizon_days = case["horizon_minutes"] / 1440.0
+    target = parse_time(case["target"])
+    release = parse_time(case.get("game", {}).get("release_date", RELEASE_AT) or RELEASE_AT)
+    if not history:
+        # No reads at all: no signal. Emit a valid, very wide forecast rather than crashing.
+        rows = [{"id": t["id"], "q": [round4(sigmoid(logit(1.0) + z * 2.0)) for z in Z]} for t in trophies]
+        return {"trophies": rows}
+
+    checkpoint = parse_time(case["at"])
+    # Per-read: hours since release, tracked players, rates.
+    reads = []
+    for h in history:
+        try:
+            t = parse_time(h["at"])
+        except Exception:
+            continue
+        n = h.get("players_tracked")
+        if n is None or n <= 0:
+            continue
+        reads.append((t, float(n), h.get("rates") or []))
+    if not reads:
+        rows = [{"id": t["id"], "q": [round4(sigmoid(logit(1.0) + z * 2.0)) for z in Z]} for t in trophies]
+        return {"trophies": rows}
+    reads.sort(key=lambda r: r[0])
+    last_t, last_n, last_rates = reads[-1]
+    hours_since_release_last = (last_t - release).total_seconds() / 3600.0
+    hours_target = (target - release).total_seconds() / 3600.0
+
+    # Is the history perfectly flat (every read identical)? Only then does the refresh prior fire.
+    flat = len({(n, tuple(rates)) for _, n, rates in reads}) == 1
+    refresh_at = parse_time(PRIOR_REFRESH_AT)
+    prior_fires = flat and last_t < refresh_at and target >= refresh_at
+    hours_to_target = (target - last_t).total_seconds() / 3600.0
+
+    # --- Model A: growth rates of tracked players and of earners, damped.
+    # Effective days of growth: growth decays as exp(-t / TAU), so H days at the current rate
+    # are worth TAU * (1 - exp(-H / TAU)) days.
+    h_eff = TAU_DAMP_DAYS * (1 - math.exp(-horizon_days / TAU_DAMP_DAYS)) if horizon_days > 0 else 0.0
+    win_a = [r for r in reads if (last_t - r[0]).total_seconds() <= FIT_A_WINDOW_H * 3600]
+    if len(win_a) < 2:
+        win_a = reads
+    # Slope of ln(tracked) vs days since the last read.
+    xs_n = [-(last_t - r[0]).total_seconds() / 86400.0 for r in win_a]
+    ys_n = [math.log(r[1]) for r in win_a]
+    _, g_n, _ = linfit(xs_n, ys_n)
+    g_n = max(-2.0, min(2.0, g_n))  # sanity: tracked cannot plausibly halve/double daily for long.
+    n_target = last_n * math.exp(g_n * h_eff)
+
+    # --- Model B inputs: logit(rate) vs ln(1 + hours since release), last 24 h.
+    win_b = [r for r in reads if (last_t - r[0]).total_seconds() <= FIT_B_WINDOW_H * 3600]
+    if len(win_b) < 3:
+        win_b = reads
+    xs_b = [math.log1p(max(0.0, (r[0] - release).total_seconds() / 3600.0)) for r in win_b]
+    x_target = math.log1p(max(0.0, hours_target))
+    x_mean = sum(xs_b) / len(xs_b)
+    sxx_b = sum((x - x_mean) ** 2 for x in xs_b)
+    shrink = horizon_days / (horizon_days + TREND_SHRINK_DAYS) if horizon_days > 0 else 0.0
+
     rows = []
-    for i, trophy in enumerate(case["trophies"]):
-        rate = last["rates"][i]
-        lg = logit(rate if rate is not None else 0)
-        rows.append({"id": trophy["id"], "q": [round4(100 / (1 + math.exp(-(lg + z * spread)))) for z in Z]})
+    for i, trophy in enumerate(trophies):
+        rate_last = last_rates[i] if i < len(last_rates) else None
+        if rate_last is None:
+            # Fall back to the most recent non-null read for this trophy.
+            rate_last = 0.0
+            for _, _, rates in reversed(reads):
+                if i < len(rates) and rates[i] is not None:
+                    rate_last = rates[i]
+                    break
+        lg_last = logit(rate_last if rate_last else 0.0)
+
+        # Model A: earners' growth.
+        e_series = []
+        for t, n, rates in win_a:
+            if i < len(rates) and rates[i] is not None:
+                e_series.append((-(last_t - t).total_seconds() / 86400.0,
+                                 math.log(max(0.25, rates[i] * n / 100.0))))
+        if len(e_series) >= 2:
+            _, g_e, _ = linfit([p[0] for p in e_series], [p[1] for p in e_series])
+            g_e = max(-2.0, min(2.0, g_e))
+        else:
+            g_e = 0.0
+        e_last = max(0.25, (rate_last if rate_last else 0.0) * last_n / 100.0)
+        e_target = min(n_target, e_last * math.exp(g_e * h_eff))
+        r_a = 100.0 * e_target / n_target if n_target > 0 else rate_last
+        lg_a = logit(r_a)
+        lg_a = max(lg_last - LOGIT_CAP, min(lg_last + LOGIT_CAP, lg_a))
+
+        # Model B: logit trend.
+        ys_b = []
+        xs_b_i = []
+        for (t, _n, rates), x in zip(win_b, xs_b):
+            if i < len(rates) and rates[i] is not None:
+                xs_b_i.append(x)
+                ys_b.append(logit(rates[i]))
+        if len(ys_b) >= 3 and sxx_b > 0 and len(set(xs_b_i)) >= 3:
+            a_b, b_b, sd_b = linfit(xs_b_i, ys_b)
+            y_mean = sum(ys_b) / len(ys_b)
+            x_mean_i = sum(xs_b_i) / len(xs_b_i)
+            lg_b = y_mean + shrink * b_b * (x_target - x_mean_i)
+            # Prediction-interval factor for the extrapolation.
+            sxx_i = sum((x - x_mean_i) ** 2 for x in xs_b_i)
+            lev = 1.0 + 1.0 / len(ys_b) + ((x_target - x_mean_i) ** 2 / sxx_i if sxx_i > 0 else 0.0)
+            s_fit = min(1.5, sd_b * math.sqrt(lev))
+        else:
+            lg_b = lg_last
+            s_fit = 0.0
+        lg_b = max(lg_last - LOGIT_CAP, min(lg_last + LOGIT_CAP, lg_b))
+
+        # Median: logit-average of the two models.
+        lg_med = (lg_a + lg_b) / 2.0
+        s_model = min(1.0, abs(lg_a - lg_b) / 2.0)
+
+        # Refresh prior (flat launch-night history only).
+        s_prior = 0.0
+        if prior_fires and rate_last < 99.99:
+            e_prior = e_last * (1.0 + PRIOR_EARNERS_PER_HOUR) ** max(0.0, hours_to_target)
+            e_prior = min(PRIOR_TRACKED, e_prior)
+            r_prior = 100.0 * e_prior / PRIOR_TRACKED
+            lg_prior = logit(r_prior)
+            # The prior is the only information about the jump: it sets the median.
+            lg_med = lg_prior
+            s_prior = PRIOR_SPREAD
+        elif rate_last >= 99.99:
+            # A trophy everyone has stays everyone's: earners track the denominator exactly.
+            lg_med = logit(99.99)
+            s_fit = 0.0
+            s_model = 0.0
+
+        # Spread: random walk + fit uncertainty + model disagreement + prior.
+        s_rw = SIGMA_RW * math.sqrt(max(0.0, horizon_days))
+        s = math.sqrt(s_rw * s_rw + s_fit * s_fit + s_model * s_model + s_prior * s_prior)
+        s = max(SPREAD_FLOOR, min(SPREAD_CAP, s))
+
+        med = sigmoid(lg_med)
+        q = [round4(sigmoid(lg_med + z * s)) for z in Z]
+        # Enforce non-decreasing (rounding can in principle tie, never invert; be safe anyway).
+        for k in range(1, 5):
+            if q[k] < q[k - 1]:
+                q[k] = q[k - 1]
+        rows.append({"id": trophy["id"], "q": q})
+
     return {"trophies": rows}
 
 
